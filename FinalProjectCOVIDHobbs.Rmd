@@ -1,0 +1,2564 @@
+---
+title: "COVID-19 Capstone"
+author: "Rachael Ray Hobbs"
+date: "2026-05-11"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE, 
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 5,
+  dpi = 300,
+  out.width = "100%"
+)
+```
+
+```{r}
+# Data wrangling and visualization
+library(tidyverse)
+library(scales)
+library(ggrepel)
+library(patchwork)
+library(gridExtra)
+library(grid)
+
+# Data splitting and preprocessing
+library(rsample)
+library(recipes)
+
+# Modeling and evaluation
+library(caret)
+library(ranger)
+library(pROC)
+library(yardstick)
+
+# Model interpretation
+library(vip)
+library(corrplot)
+
+# Association rule mining
+library(arules)
+library(arulesViz)
+```
+
+```{r}
+# Created theme for easier reading on printout
+my_theme <- theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0),
+    plot.subtitle = element_text(size = 12, hjust = 0, margin = margin(b = 6)),
+    plot.caption = element_text(size = 10, hjust = 0, margin = margin(t = 8)),
+
+    axis.title.x = element_text(face = "bold", size = 13, margin = margin(t = 8)),
+    axis.title.y = element_text(face = "bold", size = 12, margin = margin(r = 8)),
+    axis.text.x  = element_text(size = 12),
+    axis.text.y  = element_text(size = 12),
+
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.y = element_line(linewidth = 0.3, colour = "grey85"),
+
+    axis.line = element_line(linewidth = 0.4, colour = "grey40"),
+
+    legend.title = element_text(face = "bold", size = 12),
+    legend.text  = element_text(size = 11),
+    legend.position = "right",
+    legend.box.margin = margin(0, 0, 0, 8),
+
+    plot.title.position = "plot",
+    plot.caption.position = "plot",
+    plot.margin = margin(12, 18, 12, 12)
+  )
+
+
+color_map2 <- c("#7AA2C4","#4D0000")
+
+subtitle_text <- "Adverse outcome: ICU admission, intubation, or death"
+
+Age_Group_text <- "Age groups: <20, 20-35, 36-50, 51-64, 65-80, and 81+ years"
+Age_Group_labels <- c(
+  "Under 20",
+  "20-35",
+  "36-50",
+  "51-64",
+  "65-80",
+  "81+"
+)
+```
+
+```{r}
+# https://www.kaggle.com/datasets/meirnizri/covid19-dataset
+original_df <- read.csv("COVID Data.csv")
+# Clean column names for readability and spelling
+original_df <- original_df %>%
+  rename(
+    Surveillance_Unit = USMER,
+    Medical_Unit = MEDICAL_UNIT,
+    Sex = SEX,
+    Patient_Type = PATIENT_TYPE,
+    Date_Died = DATE_DIED,
+    Intubed = INTUBED,
+    Pneumonia = PNEUMONIA,
+    Age = AGE,
+    Pregnant = PREGNANT,
+    Diabetes = DIABETES,
+    COPD = COPD,
+    Asthma = ASTHMA,
+    Immunosuppressed = INMSUPR,
+    Hypertension = HIPERTENSION,
+    Other_Disease = OTHER_DISEASE,
+    Cardiovascular = CARDIOVASCULAR,
+    Obesity = OBESITY,
+    Chronic_Renal_Disease = RENAL_CHRONIC,
+    Tobacco = TOBACCO,
+    COVID_Classification = CLASIFFICATION_FINAL,
+    ICU = ICU
+  )
+```
+
+```{r}
+# 1-3 Positive
+classified_df <- original_df %>%
+  mutate(
+    COVID_Positive = case_when(
+      COVID_Classification %in% 1:3 ~ TRUE,
+      COVID_Classification %in% 4:7 ~ FALSE,
+      TRUE ~ NA
+    ),
+    COVID_Positive = factor(COVID_Positive, levels = c(FALSE, TRUE))
+  ) %>%
+  select(-COVID_Classification)
+```
+
+```{r}
+# Positive cases only
+covid_df <- classified_df %>%
+  filter(COVID_Positive == TRUE) %>%
+  select(-COVID_Positive)
+```
+
+```{r}
+# 9999-99-99 represents no recorded date of death in the file
+subset_df <- covid_df %>%
+  mutate(
+    Date_Died_raw = stringr::str_trim(as.character(Date_Died)),
+
+    Died = case_when(
+      Date_Died_raw == "9999-99-99" ~ FALSE,
+      is.na(Date_Died_raw) ~ FALSE,
+      TRUE ~ TRUE
+    ),
+
+    Date_Died = if_else(
+      Date_Died_raw == "9999-99-99",
+      NA_character_,
+      Date_Died_raw
+    ),
+
+    Date_Died = as.Date(Date_Died, format = "%d/%m/%Y"),
+    Died = factor(Died, levels = c(FALSE, TRUE))
+  ) %>%
+  select(-Surveillance_Unit, -Medical_Unit, -Date_Died, -Date_Died_raw)
+# remove medical unit info and date of death
+```
+
+```{r}
+# patient type: type of care the patient received in the unit. 1 for returned home and 2 for hospitalization.
+patient_df <- subset_df %>%
+  mutate(Hospitalized = factor(Patient_Type,
+                            levels = c(1, 2, 99),
+                            labels = c(FALSE, TRUE, NA))) %>%
+  select(-Patient_Type)
+```
+
+```{r}
+icu_df <- patient_df %>%
+  mutate(
+    ICU = case_when(
+      ICU == 1 ~ TRUE,
+      ICU == 2 ~ FALSE,
+      ICU == 97 ~ FALSE,
+      ICU == 99 ~ NA,
+      TRUE ~ NA
+    ),
+    ICU =  factor(ICU, levels = c(FALSE, TRUE))
+  )
+```
+
+```{r}
+# intubed: whether the patient was connected to the ventilator.
+intubed_df <- icu_df %>%
+  mutate(
+    Intubed = case_when(
+      Intubed == 1 ~ TRUE,
+      Intubed == 2 ~ FALSE,
+      Intubed == 97 ~ FALSE,
+      Intubed == 99 ~ NA,
+      TRUE ~ NA
+    ),
+    Intubed = factor(Intubed, levels = c(FALSE, TRUE))
+  )
+```
+
+```{r}
+# New Target Variable
+adverse_df <- intubed_df %>%
+  mutate(
+    Adverse_Outcome = (ICU == TRUE) | (Intubed == TRUE) | (Died == TRUE),
+    Adverse_Outcome = factor(
+      Adverse_Outcome,
+      levels = c(FALSE, TRUE),
+      labels = c("No", "Yes")
+    )
+  ) %>%
+  select(-ICU, -Intubed, -Died)
+# dropped original variables to prevent data leakage
+```
+
+```{r}
+# pneumonia: whether the patient has inflammation of the air sacs.
+pneumonia_df <- adverse_df %>%
+  mutate(Pneumonia = factor(Pneumonia,
+                            levels = c(1, 2, 99),
+                            labels = c(TRUE, FALSE, NA)))
+```
+
+```{r}
+# sex: 1 for female and 2 for male.
+sex_df <- pneumonia_df %>%
+  mutate(Sex = factor(Sex, levels = c(1, 2), labels = c("Female", "Male")))
+```
+
+```{r}
+# pregnancy: whether the patient is pregnant or not.
+pregnant_df <- sex_df %>%
+  mutate(
+    Pregnant = factor(Pregnant, 
+                      levels = c(1,2,97,98),
+                      labels = c(TRUE,FALSE,FALSE,NA)
+    )
+  )
+```
+
+```{r}
+# without pregnancy 
+binary_variables <- c(
+  "Diabetes",
+  "COPD",
+  "Asthma",
+  "Immunosuppressed",
+  "Hypertension",
+  "Other_Disease",
+  "Cardiovascular",
+  "Obesity",
+  "Chronic_Renal_Disease",
+  "Tobacco"
+)
+
+# binary all conditions
+dirty_df <- pregnant_df %>%
+  mutate(
+    across(
+      all_of(binary_variables),
+      ~ case_when(
+        .x == 1 ~ TRUE,
+        .x == 2 ~ FALSE,
+        TRUE ~ NA
+      )
+    )
+  )
+```
+
+```{r}
+cleaned_df <- na.omit(dirty_df)
+```
+
+```{r}
+# New Feature: Condition Count, excludes tobacco
+# New Feature: Age Group
+condition_variables <- setdiff(binary_variables, "Tobacco")
+
+cleaned_df <- cleaned_df %>%
+  mutate(
+    Condition_Count = rowSums(
+      across(all_of(condition_variables), 
+             ~ as.integer(as.character(.x) %in% c("TRUE", "Yes"))),
+      na.rm = TRUE),
+      Age_Group = case_when(
+      Age < 20 ~ "Under 20",
+      Age >= 20 & Age <= 35 ~ "20-35",
+      Age >= 36 & Age <= 50 ~ "36-50",
+      Age >= 51 & Age <= 64 ~ "51-64",
+      Age >= 65 & Age <= 80 ~ "65-80",
+      Age >= 81 ~ "81+",
+      TRUE ~ NA_character_
+    ),
+    
+    Age_Group = factor(
+      Age_Group,
+      levels = c("Under 20", "20-35", "36-50", "51-64", "65-80", "81+")
+    )
+  )
+```
+
+```{r}
+# All binary with pregnant
+binary_variables <- c(
+  "Pneumonia",
+  "Pregnant",
+  "Diabetes",
+  "COPD",
+  "Asthma",
+  "Immunosuppressed",
+  "Hypertension",
+  "Other_Disease",
+  "Cardiovascular",
+  "Obesity",
+  "Chronic_Renal_Disease",
+  "Tobacco"
+)
+
+cleaned_df <- cleaned_df %>%
+  mutate(
+    across(
+      all_of(binary_variables),
+      ~ factor(
+        if_else(.x == TRUE, "Yes", "No"),
+        levels = c("No", "Yes")
+      )
+    )
+  )
+```
+
+```{r}
+# New Feature: Boolean of no conditons
+cleaned_df <- cleaned_df %>%
+  mutate(
+    No_Conditions = if_else(Condition_Count == 0, "Yes", "No"),
+    No_Conditions = factor(No_Conditions, levels = c("No", "Yes")),
+
+    Condition_Count = if_else(Condition_Count >= 4, "4+", as.character(Condition_Count)),
+    Condition_Count = factor(
+      Condition_Count,
+      levels = c("0", "1", "2", "3", "4+"),
+      ordered = FALSE
+    )
+  )
+```
+
+```{r}
+# Reduced dataframe for smaller models
+predictor_df <- cleaned_df %>%
+  select(-Adverse_Outcome)
+
+nzv_cols <- nearZeroVar(predictor_df, names = TRUE)
+
+df_nzv_removed <- cleaned_df %>%
+  select(-all_of(nzv_cols))
+```
+
+## 1. Introduction
+
+During early 2020, COVID-19 rapidly escalated into a global pandemic and raised widespread concern about severe health outcomes. My interest in this topic is both personal and academic, as I lost my uncle to COVID-19 complications after a history of diabetes and cardiovascular disease. This experience influenced my interest in using data science to examine health risk patterns.
+
+Although the most severe phase of the pandemic has passed, COVID-19 variants continue to circulate, and future infectious disease outbreaks remain possible. This project examines how pre-existing conditions and demographic factors are associated with severe COVID-19 outcomes across age groups. Understanding these relationships may support risk identification, public health planning, and future predictive modeling.
+
+## 2. Literature Review and Research Gap
+
+###  2.1 Prior Findings on COVID-19 Severity
+
+Prior research consistently identifies older age and male sex as major predictors of severe COVID-19 outcomes. Pre-existing conditions also increase the risk of ICU admission, intubation, and death, especially when multiple chronic conditions are present. Commonly reported risk factors include hypertension, obesity, diabetes, immunosuppression, cardiovascular disease, and chronic kidney disease.
+
+Studies using Mexico’s national COVID-19 surveillance data found that hypertension, obesity, and diabetes were among the most common comorbidities in confirmed positive cases. Hypertension and diabetes were also associated with higher fatality rates than obesity. Similar findings have been reported in other populations, although the strength of these relationships varies by age group and patient characteristics. In very old adults, age-related vulnerability may dominate the effect of individual comorbidities.
+
+###  2.2 Modeling Approaches in Prior Research
+
+Logistic regression is commonly used to study COVID-19 severity because it provides interpretable odds ratios. Machine learning models, including random forest, support vector machines, gradient boosting, neural networks, generalized additive models, and ensemble approaches, have also been used to improve prediction and capture nonlinear relationships, though they are often less interpretable.
+
+Prior research shows that clinical measurements, such as oxygen saturation and laboratory values, often dominate predictive models when available. Because the Kaggle version of this dataset does not include detailed clinical or laboratory measures, this project focuses on demographic variables and chronic conditions.
+
+Association rule mining has been used less often in COVID-19 severity research, but it is useful for identifying combinations of binary risk factors. In this project, it supports exploratory analysis of age-stratified patterns involving pre-existing conditions.
+
+###  2.3 Research Gap
+
+Although many studies have examined COVID-19 risk factors, fewer have focused on pre-existing conditions as the primary predictors. Chronic conditions are often overshadowed by stronger predictors such as age, laboratory values, or acute clinical indicators. Much of the prior research also focuses on a single severe outcome, especially mortality or hospitalization.
+
+This study addresses that gap by focusing on pre-existing conditions and using a composite adverse outcome defined as ICU admission, intubation, or death. The analysis compares interpretable and flexible supervised models while also using association rule mining to identify condition combinations and possible interaction patterns. This supports both prediction and interpretation using the variables available in the translated Kaggle dataset.
+
+## 3. Research Questions
+
+**Question 1**. Which demographic factors, health behaviors, and pre-existing conditions are most strongly associated with severe COVID-19 outcomes across age groups?
+
+**Question 2**. Which combinations of pre-existing conditions and tobacco use are associated with elevated severe outcome risk, and how do these patterns vary by age group?
+
+**Question 3**. How do logistic regression and random forest compare in predicting severe COVID-19 outcomes using accuracy, sensitivity, specificity, F1-score, and AUC?
+
+## 4. Dataset and Methodology
+
+### 4.1 Dataset Description
+
+This study uses a publicly available COVID-19 dataset from Kaggle (Nizri, 2023), derived from Mexico’s national surveillance system for suspected viral respiratory disease cases identified through health-sector medical units. The original dataset covers 2020 through May 2021 and contains 1,048,575 observations and 21 variables, including positive and negative COVID-19 test records with demographic, clinical, and comorbidity information.
+
+This analysis was restricted to laboratory-confirmed positive cases. After cleaning and recoding, the final analytic dataset contained 388,719 observations and 19 variables. Because the data were collected through healthcare surveillance reporting, they should not be interpreted as a random sample of the general population. Individuals who did not seek care, were not tested, or were tested outside the reporting structure may not be represented.
+
+The dataset includes age, sex, pregnancy status, obesity, tobacco use, and several pre-existing conditions, including diabetes, COPD, asthma, immunosuppression, hypertension, cardiovascular disease, chronic renal disease, and "other disease." ICU admission, intubation, and death were combined into one binary adverse outcome variable.
+
+Because several predictors had near-zero variance, a reduced dataset was also created for modeling comparison. The variables removed from the reduced dataset were pregnancy status, COPD, asthma, immunosuppression, other disease, cardiovascular disease, and chronic renal disease, resulting in a reduced dataset with 12 variables.
+
+### 4.2 Data Preparation
+
+The analysis was limited to laboratory-confirmed positive COVID-19 cases. Numeric response codes were recoded into readable binary categories, while values representing missing, unknown, or not applicable responses were treated as missing.
+
+Missing values were handled using listwise deletion, removing 3,260 positive observations. Age was grouped into six categories: Under 20, 20-35, 36-50, 51-64, 65-80, and 81+.
+
+A condition count variable was created by summing the number of pre-existing medical conditions for each patient and grouping counts as 0, 1, 2, 3, or 4+. Tobacco use was kept as a separate behavioral risk factor rather than included in the condition count.
+
+A composite adverse outcome variable was created from ICU admission, intubation, and death. After this outcome was created, the original outcome variables and health-system identifiers, such as medical unit and surveillance unit, were removed from the modeling dataset.
+
+### 4.3 Modeling Strategy
+
+This project uses both supervised and exploratory methods. Logistic regression and random forest were used to predict adverse outcome and compare model performance. Logistic regression was selected for interpretability, while random forest was selected for its ability to capture nonlinear patterns and interactions.
+
+Model performance was evaluated using accuracy, sensitivity, specificity, F1-score, and AUC. Because adverse outcomes were less common than non-adverse outcomes, sensitivity and F1-score were emphasized over accuracy.
+
+Association rule mining was used as an exploratory method to identify combinations of pre-existing conditions, tobacco use, sex, and age group associated with adverse outcomes. Rules were evaluated using support, confidence, and lift, and were used to guide interpretation and selected logistic regression interaction terms.
+
+## 5. Exploratory Data Analysis Results
+
+Three derived features were created for EDA: `No_Conditions`, `Condition_Count`, and `Age_Group`. In the final analytic dataset, 58% of patients had no recorded pre-existing conditions, while only 1.3% had four or more conditions. Counts of four or more were combined into a `4+` category to reduce sparsity.
+
+Age was grouped into six categories: Under 20, 20-35, 36-50, 51-64, 65-80, and 81+. These groups supported age-stratified exploratory analysis and association rule mining.
+
+### 5.1 Correlation Plot
+
+```{r fig.cap="Figure 1. Correlation plot of predictors and adverse outcome.", fig.width=10, fig.height=7}
+binary_cor_vars <- c(
+  "No_Conditions",
+  "Pregnant",
+  "Tobacco",
+  "Diabetes",
+  "COPD",
+  "Asthma",
+  "Immunosuppressed",
+  "Hypertension",
+  "Other_Disease",
+  "Cardiovascular",
+  "Obesity",
+  "Chronic_Renal_Disease",
+  "Hospitalized",
+  "Pneumonia",
+  "Adverse_Outcome"
+)
+
+cor_df <- cleaned_df %>%
+  mutate(
+    Condition_Count_Num = case_when(
+      Condition_Count == "0" ~ 0,
+      Condition_Count == "1" ~ 1,
+      Condition_Count == "2" ~ 2,
+      Condition_Count == "3" ~ 3,
+      Condition_Count == "4+" ~ 4,
+      TRUE ~ NA_real_
+    ),
+    Sex_Male = if_else(Sex == "Male", 1, 0)
+  ) %>%
+  mutate(
+    across(
+      all_of(binary_cor_vars),
+      ~ case_when(
+        .x == "Yes" ~ 1,
+        .x == "No" ~ 0,
+        .x == TRUE ~ 1,
+        .x == FALSE ~ 0,
+        TRUE ~ NA_real_
+      )
+    )
+  ) %>%
+  select(
+    Age,
+    Sex_Male,
+    Condition_Count_Num,
+    all_of(binary_cor_vars)
+  )
+
+cor_mat <- cor(cor_df, use = "pairwise.complete.obs")
+cor_mat <- round(cor_mat, 2)
+
+corrplot(
+  cor_mat,
+  method = "color",
+  type = "upper",
+  tl.cex = 0.85,
+  addCoef.col = "black",
+  number.cex = 0.7
+)
+
+png("fig1correlation_plot.png", width = 3000, height = 2200, res = 300)
+
+corrplot(
+  cor_mat,
+  method = "color",
+  type = "upper",
+  tl.cex = 0.85,
+  addCoef.col = "black",
+  number.cex = 0.7
+)
+
+dev.off()
+```
+
+
+Figure 1 shows the correlation structure among demographic variables, condition indicators, hospitalization, pneumonia, and adverse outcome. Hospitalization had a moderately strong positive correlation with `Adverse_Outcome` at 0.60, which is expected because ICU admission and intubation generally occur in hospital settings and patients at highest risk of death are more likely to require hospital care.
+
+Pneumonia was also moderately correlated with both adverse outcome and hospitalization, with correlations of 0.55 and 0.67, respectively. To reduce potential data leakage, hospitalization was excluded from the supervised models. Pneumonia was retained for exploratory analysis but excluded from supervised modeling because the main focus was pre-existing conditions, demographics, and their interactions.
+
+The strongest feature-redundancy pattern was between `No_Conditions` and `Condition_Count`, which was expected because one was derived from the other. Therefore, `No_Conditions` was removed from the supervised models. `Age_Group` was also excluded when continuous `Age` was used to avoid including two versions of the same underlying variable.
+
+Age was moderately correlated with condition count, diabetes, hypertension, hospitalization, pneumonia, and adverse outcome, with correlations ranging from 0.33 to 0.41. Male sex had weak correlations with all features, with its largest correlation being 0.10 with adverse outcome. Among pre-existing conditions, diabetes and hypertension had the strongest pairwise correlation at 0.37, while all other condition-to-condition correlations were below 0.18.
+
+### 5.2 Adverse Outcome and Sex Distribution
+
+```{r, include=FALSE}
+adverse_table <- na.omit(intubed_df) # dataframe before adverse outcome created
+
+outcome_summary_wide <- bind_rows(
+  lapply(
+    names(adverse_table[c("Intubed", "ICU", "Died", "Hospitalized")]),
+    function(var) {
+      tab <- prop.table(table(adverse_table[[var]]))
+
+      tibble(
+        Variable = var,
+        No = scales::percent(as.numeric(tab["FALSE"]), accuracy = 0.1),
+        Yes = scales::percent(as.numeric(tab["TRUE"]), accuracy = 0.1)
+      )
+    }
+  )
+)
+
+knitr::kable(
+  outcome_summary_wide,
+  caption = "Table X. Distribution of ICU admission, intubation, death, and hospitalization among confirmed positive cases."
+)
+```
+
+The target variable, `Adverse_Outcome`, was defined as whether a patient was intubated, admitted to the ICU, or died. Death was the most common component, occurring in 13.6% of confirmed positive cases, followed by intubation at 6.1% and ICU admission at 2.7%.
+
+These outcomes were combined because all three represent severe COVID-19 outcomes and reflect the broader concern that healthcare systems could become overwhelmed by critically ill patients.
+
+Hospitalization was strongly related to `Adverse_Outcome`. Approximately 28.2% of confirmed positive patients were hospitalized after evaluation at a medical unit. Because hospitalization is closely tied to ICU admission and intubation, it was retained for exploratory analysis but excluded from supervised models to reduce potential data leakage.
+
+```{r}
+# plot hospitalizations outcomes
+plot_df <- cleaned_df %>%
+  count(Sex, Adverse_Outcome, name = "n") %>%
+  group_by(Sex) %>%
+  mutate(
+    group_total = sum(n),
+    within_group_percent = n/group_total
+  ) %>%
+  ungroup() %>%
+  mutate(
+    overall_percent=n/sum(n)
+  )
+
+totals_df <- cleaned_df %>%
+  count(Sex) %>%
+  mutate(percent = n / sum(n)) %>%
+  ungroup()
+
+sex_bar <- ggplot(plot_df, aes(x = factor(Sex), y = overall_percent, fill = factor(Adverse_Outcome))) +
+  geom_col(width = 0.75) +
+  geom_text(
+    aes(label = percent(within_group_percent, accuracy = 0.1)),
+    position = position_stack(vjust = 0.5),
+    size = 4,
+    color = "white"
+  ) +
+  scale_fill_manual(values = color_map2) +
+  scale_y_continuous(
+    labels = percent,
+    breaks = pretty_breaks(n = 10),
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+    geom_text(
+    data = totals_df,
+    aes(
+      x = factor(Sex),
+      y = percent + 0.02,
+      label = scales::percent(percent, accuracy = 0.1)
+    ),
+    inherit.aes = FALSE,
+    size = 4,
+    fontface = "bold"
+  ) +
+  labs(
+    title = "Adverse Outcome by Sex",
+    subtitle = NULL,
+    x = "Sex",
+    y = "Percent of All Patients",
+    fill = "Adverse\nOutcome"
+  ) +
+  my_theme +
+  theme(legend.position = "left")
+```
+
+```{r}
+# plot adverse outcomes
+y_bar <- ggplot(cleaned_df, aes(x = factor(Adverse_Outcome), fill = factor(Adverse_Outcome))) +
+  geom_bar(aes(y = after_stat(count / sum(count)))) +
+  geom_text(
+    aes(
+      y = after_stat(count / sum(count)),
+      label = scales::percent(after_stat(count / sum(count)), accuracy = 0.1)
+    ),
+    stat = "count",
+    vjust = -0.4,
+    size = 4,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(values = color_map2) +
+  scale_y_continuous(
+    labels = scales::percent,
+    breaks = scales::pretty_breaks(n = 8),
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+  title = "Overall Adverse Outcome",
+    subtitle = NULL,
+    x = "Adverse Outcome",
+    y = "Percent of Patients"
+  )+
+  my_theme +
+  theme(legend.position = "none")
+```
+
+```{r fig.cap = "Figure 2. Adverse outcome distribution by sex and overall outcome status."}
+combined_sex_plot <- grid.arrange(
+  sex_bar, y_bar,
+  nrow = 1
+)
+```
+
+Among confirmed positive cases evaluated through medical units, 53.4% were male. Adverse outcomes were more common among males, with 18.7% experiencing at least one adverse outcome compared with 11.7% of females.
+
+This difference may reflect factors such as occupational exposure, delayed testing or treatment, healthcare-seeking behavior, or biological differences. However, these cannot be confirmed from the dataset, so the sex-based difference should be interpreted as an association rather than a causal effect.
+
+```{r}
+ggsave(
+  filename = "fig2_sex_distribution_outcomes.png",
+  plot = combined_sex_plot,
+  width = 14,
+  height = 7,
+  dpi = 300
+)
+```
+
+### 5.3 Age and Adverse Outcome Distribution
+
+```{r}
+# Mean age
+mean_age <- mean(cleaned_df$Age, na.rm = TRUE)
+
+# Age distribution for all confirmed COVID-19 cases
+p1 <- ggplot(cleaned_df, aes(x = Age)) +
+  geom_histogram(
+    binwidth = 5,
+    boundary = 0,
+    fill = "#6B8EAE",
+    color = "white",
+    linewidth = 0.2
+  ) +
+  geom_vline(
+    xintercept = mean_age,
+    color = "#4D0000",
+    linewidth = 1
+  ) +
+  annotate(
+    "label",
+    x = mean_age + 5,
+    y = Inf,
+    label = paste0("Mean: ", round(mean_age, 1)),
+    vjust = 1.3,
+    size = 3.5,
+    label.size = 0.15
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 120, by = 10),
+    limits = c(0, 120)
+  ) +
+  scale_y_continuous(
+    labels = scales::label_number(big.mark = ","),
+    breaks = seq(0, 45000, by = 2500),
+    expand = expansion(mult = c(0, 0.08))
+  ) +
+  labs(
+    title = "Age Distribution",
+    x = "Age (Years)",
+    y = "Number of Patients"
+  ) +
+  theme(
+  plot.margin = margin(5, 5, 5, 5)
+) +
+  my_theme
+```
+
+```{r}
+# Percent adverse outcome within each age group
+p2 <- ggplot(cleaned_df, aes(x = Age_Group, fill = Adverse_Outcome)) +
+  geom_bar(
+    position = "stack",
+    color = "white",
+    linewidth = 0.2
+  ) +
+  scale_fill_manual(
+    name = "Adverse\nOutcome",
+    values = color_map2
+  ) +
+  scale_y_continuous(
+    labels = scales::label_number(big.mark = ","),
+    breaks = seq(0, 130000, by = 10000),
+    expand = expansion(mult = c(0, 0.08))
+  ) +
+  labs(
+    title = "Adverse Outcomes by Age Group",
+    subtitle = NULL,
+    x = "Age Group",
+    y = "Number of Patients"
+  ) +
+  my_theme +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1, plot.margin = margin(5, 5, 5, 5))
+  )
+```
+
+```{r fig.cap = "Figure 3. Age distribution and adverse outcome counts by age group."}
+combined_age_plot <- grid.arrange(
+  p1, p2,
+  nrow = 1
+)
+```
+
+The mean age was 45.1 years, and the distribution was slightly right-skewed, with a small number of observations over 100 years old. Age was grouped to make comparisons across age ranges easier and to support age-stratified association rule mining.
+
+Figure 3 shows that adverse outcomes occurred more often in older age groups. This pattern is consistent with prior COVID-19 research identifying age as one of the strongest predictors of severe outcomes.
+
+```{r}
+ggsave(
+  filename = "fig3_age_distribution_outcomes.png",
+  plot = combined_age_plot,
+  width = 14,
+  height = 7,
+  dpi = 300
+)
+```
+
+```{r fig.cap = "Figure 4. Hospitalization and adverse outcome by age group."}
+plot_df <- cleaned_df %>%
+  count(Hospitalized, Age_Group, Adverse_Outcome) %>%
+  group_by(Age_Group) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  group_by(Age_Group, Hospitalized) %>%
+  mutate(hos_prop = n / sum(n)) %>%
+  ungroup()
+
+totals_df <- cleaned_df %>%
+  count(Age_Group, Hospitalized) %>%
+  group_by(Age_Group) %>%
+  mutate(percent = n / sum(n)) %>%
+  ungroup()
+
+totals_df$Age_Group <- factor(
+  totals_df$Age_Group,
+  levels = c("Under 20", "20-35", "36-50", "51-64", "65-80", "81+")
+)
+
+plot_df$Age_Group <- factor(
+  plot_df$Age_Group,
+  levels = c("Under 20", "20-35", "36-50", "51-64", "65-80", "81+")
+)
+
+p5 <- ggplot(plot_df, aes(x = Age_Group, y = prop, fill = Adverse_Outcome)) +
+  geom_col(color = "white", linewidth = 0.2) +
+  geom_text(
+    aes(
+      label = ifelse(
+        hos_prop > 0.01,
+        scales::percent(hos_prop, accuracy = 0.1),
+        ""
+      )
+    ),
+    position = position_stack(vjust = 0.5),
+    size = 3.2,
+    color = "white",
+    fontface = "bold"
+  ) +
+  geom_text(
+    data = totals_df,
+    aes(
+      x = Age_Group,
+      y = percent + 0.02,
+      label = ifelse(
+        percent > 0.01,
+        scales::percent(percent, accuracy = 0.1),
+        ""
+      )
+    ),
+    inherit.aes = FALSE,
+    size = 4,
+    fontface = "bold"
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0, 1, by = 0.1),
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  scale_fill_manual(
+    values = color_map2,
+    name = "Adverse\nOutcome"
+  ) +
+  labs(
+    title = "Hospitalization by Age Group",
+    subtitle = NULL,
+    x = "Age Group",
+    y = "Percent Within Age Group"
+) +
+  facet_wrap(
+    ~ Hospitalized,
+    labeller = as_labeller(c(
+      "FALSE" = "Sent Home",
+      "TRUE" = "Hospitalized"
+    ))
+  ) +
+  my_theme +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold", size = 12)
+  )
+
+p5
+```
+
+Approximately 90% of patients under age 35 were sent home, while hospitalization increased with age, reaching about 70% in the 81+ group. Adverse outcomes also increased with age, showing a clear age-related severity pattern. Patients under age 20 had slightly higher hospitalization and adverse outcome rates than the 20-35 group.
+
+Among patients who were sent home, adverse outcomes still occurred. The rate increased from about 1% in the 36-50 group to nearly 16% in the 81+ group, suggesting that older age remained associated with severe outcomes even among patients who were not initially hospitalized.
+
+```{r}
+ggsave("fig4age_adverse_bar.png", 
+       plot = p5,
+       width = 12,
+       height = 6,
+       dpi = 300
+       )
+```
+
+### 5.4 Condition Patterns
+
+```{r}
+condition_plot_vars <- c(
+  "Pneumonia",
+  "Diabetes",
+  "COPD",
+  "Asthma",
+  "Immunosuppressed",
+  "Hypertension",
+  "Other_Disease",
+  "Cardiovascular",
+  "Obesity",
+  "Chronic_Renal_Disease",
+  "Tobacco",
+  "No_Conditions"
+)
+
+condition_labels <- c(
+  "Pneumonia" = "Pneumonia",
+  "Diabetes" = "Diabetes",
+  "COPD" = "COPD",
+  "Asthma" = "Asthma",
+  "Immunosuppressed" = "Immunosuppressed",
+  "Hypertension" = "Hypertension",
+  "Other_Disease" = "Other Disease",
+  "Cardiovascular" = "Cardiovascular",
+  "Obesity" = "Obesity",
+  "Chronic_Renal_Disease" = "Chronic Renal Disease",
+  "Tobacco" = "Tobacco Use",
+  "No_Conditions" = "No Conditions"
+)
+
+total_patients <- nrow(cleaned_df)
+
+plot_data <- cleaned_df %>%
+  select(all_of(condition_plot_vars), Adverse_Outcome) %>%
+  pivot_longer(
+    cols = all_of(condition_plot_vars),
+    names_to = "Condition",
+    values_to = "Has_Condition"
+  ) %>%
+  mutate(
+    Group = case_when(
+      Has_Condition == "Yes" & Adverse_Outcome == "Yes" ~ "Has condition + adverse outcome",
+      Has_Condition == "Yes" & Adverse_Outcome == "No"  ~ "Has condition + no adverse outcome",
+      TRUE                                               ~ NA_character_
+    ),
+    Group = factor(
+      Group,
+      levels = c(
+        "Has condition + no adverse outcome",
+        "Has condition + adverse outcome"
+      )
+    ),
+    Condition = factor(
+      Condition,
+      levels = condition_plot_vars,
+      labels = condition_labels
+    )
+  ) %>%
+  filter(!is.na(Group)) %>%
+  count(Condition, Group, name = "n") %>%
+  group_by(Condition) %>%
+  mutate(
+    percent = n / total_patients,
+    within_condition_percent = n / sum(n)
+  ) %>%
+  ungroup()
+
+bar_totals <- plot_data %>%
+  group_by(Condition) %>%
+  summarise(
+    total_percent = sum(percent),
+    .groups = "drop"
+  ) 
+
+plot_data <- plot_data %>%
+  left_join(bar_totals, by = "Condition")
+
+y_max <- max(bar_totals$total_percent, na.rm = TRUE)
+```
+
+```{r}
+# plot conditions percentages
+p3 <- ggplot(plot_data, aes(x = Condition, y = percent, fill = Group)) +
+  geom_col(color = "white", linewidth = 0.2) +
+  geom_text(
+    data = bar_totals,
+    aes(
+      x = Condition,
+      y = total_percent + 0.02,
+      label = scales::percent(total_percent, accuracy = 0.1)
+    ),
+    inherit.aes = FALSE,
+    size = 3.6,
+    fontface = "bold",
+    color = "black"
+  ) +
+  scale_fill_manual(
+    values = color_map2,
+    labels = c(
+      "Has condition + no adverse outcome" = "No",
+      "Has condition + adverse outcome" = "Yes"
+    )
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0, ceiling(y_max * 10) / 10, by = 0.05),
+    limits = c(0, y_max + 0.05),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    title = "Condition Prevalence",
+    subtitle = NULL,
+    x = NULL,
+    y = "Percent of All Patients",
+    fill = "Adverse\nOutcome"
+  ) +
+  my_theme +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    legend.position = "bottom"
+  )
+
+```
+
+```{r}
+p4 <- ggplot(plot_data, aes(x = Condition, y = percent, fill = Group)) +
+  geom_col(
+    position = "fill",
+    color = "white",
+    linewidth = 0.2
+  ) +
+  geom_text(
+    aes(
+      label = scales::percent(within_condition_percent, accuracy = 1)
+    ),
+    position = position_fill(vjust = 0.5),
+    size = 3.4,
+    color = "white",
+    fontface = "bold"
+  ) +
+  scale_fill_manual(
+    values = color_map2,
+    labels = c(
+      "Has condition + no adverse outcome" = "No",
+      "Has condition + adverse outcome" = "Yes"
+    )
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0, 1, by = 0.1),
+    limits = c(0, 1),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    title = "Adverse Outcome Rate",
+    subtitle = NULL,
+    x = NULL,
+    y = "Percent Within Condition",
+    fill = "Adverse\nOutcome"
+  ) +
+  my_theme +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    legend.position = "bottom"
+  )
+```
+
+```{r fig.cap = "Figure 5. Condition prevalence and adverse outcome rates by condition."}
+combined_condition_plot <- grid.arrange(
+  p3, p4,
+  nrow = 1
+)
+```
+
+Figure 5 shows condition prevalence and adverse outcome rates by condition. Several near-zero variance conditions had low prevalence, including asthma, immunosuppression, other disease, cardiovascular disease, chronic renal disease, and COPD, with prevalence values ranging from approximately 1.2% to 2.7%.
+
+However, low prevalence did not always mean low clinical importance. Asthma had the lowest adverse outcome rate among the removed variables at 12%, below the overall adverse outcome rate. In contrast, the other removed conditions had adverse outcome rates ranging from 29% to 44%, above the overall average. These variables, along with pregnancy status, were removed from the reduced dataset because of sparse representation but were retained in the full-feature model for comparison.
+
+```{r}
+ggsave("fig5conditions_adverse_bar.png", 
+       plot = combined_condition_plot,
+       width = 12,
+       height = 6,
+       dpi = 300
+       )
+```
+
+```{r}
+plot_df <- cleaned_df %>%
+  count(Hospitalized, Condition_Count, Adverse_Outcome) %>%
+  group_by(Condition_Count) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  group_by(Condition_Count, Hospitalized) %>%
+  mutate(
+    hos_prop = n / sum(n),
+    inside_label = scales::percent(hos_prop, accuracy = 0.1)
+  ) %>%
+  ungroup()
+
+totals_df <- cleaned_df %>%
+  count(Condition_Count, Hospitalized) %>%
+  group_by(Condition_Count) %>%
+  mutate(
+    percent = n / sum(n),
+    top_label = scales::percent(percent, accuracy = 0.1)
+  ) %>%
+  ungroup()
+```
+
+```{r fig.cap = "Figure 6. Hospitalization and adverse outcome by condition count."}
+p5 <- ggplot(plot_df, aes(x = factor(Condition_Count), 
+                          y = prop, fill = Adverse_Outcome)) +
+  geom_col(color = "white", linewidth = 0.2) +
+  geom_text(
+    aes(label = inside_label),
+    position = position_stack(vjust = 0.5),
+    size = 3.4,
+    color = "white",
+    fontface = "bold"
+  ) +
+  geom_text(
+    data = totals_df,
+    aes(
+      x = factor(Condition_Count),
+      y = percent + 0.02,
+      label = top_label
+    ),
+    inherit.aes = FALSE,
+    size = 3.8,
+    fontface = "bold",
+    color = "black"
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0, 1, by = 0.1),
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  scale_fill_manual(
+    values = color_map2,
+    name = "Adverse\nOutcome"
+  ) +
+  labs(
+    title = "Hospitalization by Condition Count",
+    subtitle = NULL,
+    x = "Number of Pre-existing Conditions",
+    y = "Percent Within Condition Count"
+  ) +
+  facet_wrap(
+    ~ Hospitalized,
+    labeller = as_labeller(c(
+      "FALSE" = "Sent Home",
+      "TRUE" = "Hospitalized"
+    ))
+  ) +
+  my_theme +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold", size = 12)
+  )
+
+p5
+condition_count_table <- cleaned_df %>%
+  count(Condition_Count, name = "Count") %>%
+  mutate(
+    Percent = Count / sum(Count),
+    Percent = scales::percent(Percent, accuracy = 0.1)
+  ) %>% 
+select(-Count)
+```
+
+Figure 6 shows that hospitalization increased with the number of pre-existing conditions. Among patients with no recorded conditions, 18.0% were hospitalized, compared with 67.0% of patients with four or more conditions.
+
+Adverse outcomes were uncommon among patients who were sent home, but they still occurred. Among sent-home patients, the adverse outcome rate increased from about 0.9% for those with no recorded conditions to 12.6% for those with four or more conditions.
+
+Most confirmed positive cases had few recorded conditions: 58.0% had none, 24.9% had one, 11.5% had two, 4.3% had three, and 1.3% had four or more. Although the 4+ group was small, it had the highest hospitalization rate and the highest adverse outcome rate, suggesting greater vulnerability among patients with multiple pre-existing conditions.
+
+```{r}
+ggsave("fig6condition_count_adverse_bar.png", 
+       plot = p5,
+       width = 12,
+       height = 6,
+       dpi = 300
+       )
+```
+
+### 5.5 Key EDA Takeaways for Modeling
+
+EDA suggested that age, chronic renal disease, COPD, diabetes, hypertension, obesity, sex, and tobacco use were important variables for modeling. Several potential interaction patterns were also observed, especially between hypertension and obesity, diabetes and obesity, sex and selected conditions, and tobacco use across age groups.
+
+Pneumonia, hospitalization status, age group, pregnancy status, and `No_Conditions` were removed from the supervised models because they were highly correlated with the outcome, redundant with other predictors, or outside the main modeling focus. The final supervised models focused on demographic variables and pre-existing conditions.
+
+
+## 6. Association Rule Mining Results
+
+Association rule mining, also known as market basket analysis, is an unsupervised method used to identify patterns among binary features. In this study, it was used to find combinations of age group, sex, tobacco use, and pre-existing conditions associated with adverse COVID-19 outcomes.
+
+Each rule includes a left-hand side, or antecedent, and a right-hand side, or consequent. The right-hand side was fixed as `Adverse_Outcome`. Rules were evaluated using support, confidence, and lift. Support measures how often the rule occurs, confidence measures the probability of adverse outcome given the rule conditions, and lift compares that probability to the overall adverse outcome rate.
+
+Association rule mining was not used as a predictive model. Instead, it supported interpretation and helped identify possible interaction patterns for logistic regression.
+
+```{r}
+covid_basket_df <- cleaned_df %>%
+  select(-c(Pneumonia, Hospitalized, Age, Condition_Count, Pregnant, No_Conditions)) %>%
+  mutate(
+    across(
+      -c(Sex, Age_Group),
+      ~ case_when(
+        .x == "Yes" ~ TRUE,
+        .x == "No" ~ FALSE,
+        TRUE ~ NA
+      )
+    )
+  )
+```
+
+```{r}
+covid_basket <- as(covid_basket_df, "transactions")
+```
+
+```{r}
+rhs_item <- "Adverse_Outcome"
+
+lhs <- setdiff(itemLabels(covid_basket), rhs_item)
+
+rules <- apriori(
+  data = covid_basket,
+  parameter = list(
+    supp = 0.002,
+    conf = 0.5,
+    minlen = 2
+  ),
+  appearance = list(
+    rhs = rhs_item,
+    lhs = lhs,
+    default = "none"
+  ),
+  control = list(verbose = FALSE)
+)
+
+rules <- sort(rules, decreasing=TRUE, by="lift")
+```
+
+```{r}
+sexless_df <- covid_basket_df %>%
+  select(-Sex)
+sexless_basket <- as(sexless_df, "transactions")
+```
+
+```{r}
+rhs_item <- "Adverse_Outcome"
+
+lhs <- setdiff(itemLabels(sexless_basket), rhs_item)
+
+rules_sexless <- apriori(
+  data = sexless_basket,
+  parameter = list(
+    supp = 0.002,
+    conf = 0.5,
+    minlen = 2
+  ),
+  appearance = list(
+    rhs = rhs_item,
+    lhs = lhs,
+    default = "none"
+  ),
+  control = list(verbose = FALSE)
+)
+
+rules_sexless <- sort(rules_sexless, decreasing=TRUE, by="lift")
+```
+
+
+### 6.1 Method
+
+```{r, include=FALSE}
+length(rules)
+length(rules_sexless)
+```
+
+Two association rule sets were generated: one including sex and one excluding sex. Both used minimum support of 0.002 and minimum confidence of 0.50. Because the overall adverse outcome rate was approximately 15%, this confidence threshold generally corresponded to lift values above 3.
+
+The full rule set produced 52 rules, while the rule set excluding sex produced 29 rules. The tables show the top rules by lift, and the scatter plots examine the top 25 rules from each set.
+
+### 6.2 Main Rule Patterns
+
+```{r}
+rules_top <- head(
+  rules[order(arules::quality(rules)$lift, decreasing = TRUE)],
+  25
+)
+
+rules_df <- as(rules_top, "data.frame")
+
+rules_df <- rules_df %>%
+  arrange(desc(lift))
+
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+rules_df$rhs <- sub(".*=> ", "", rules_df$rules)
+
+rules_df <- rules_df[, c("lhs", "support", "confidence", "lift")]
+knitr::kable(rules_df[1:10,], digits = 3, caption = "Table 1. Top 10 Rules for Adverse Outcome (with sex)")
+```
+
+In the rule set that included sex, the top-ranked rules were dominated by males. The highest-lift rules involved males ages 81+, with lift values around 4. Other high-ranking rules involved individuals ages 65-80 with chronic renal disease, with lift values around 3.9. No female rules appeared among the top-ranked rules, although female-specific patterns are shown in Figure 7.
+
+```{r}
+rules_top_sexless <- head(rules_sexless[order(arules::quality(rules_sexless)$lift, decreasing = TRUE)], 25)
+
+rules_df <- as(rules_top_sexless, "data.frame")
+
+rules_df <- rules_df %>%
+  arrange(desc(lift))
+
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+rules_df$rhs <- sub(".*=> ", "", rules_df$rules)
+
+rules_df <- rules_df[, c("lhs", "support", "confidence", "lift")]
+knitr::kable(rules_df[1:10,], digits = 3, caption = "Table 2. Top 10 Rules for Adverse Outcome (without sex)")
+```
+
+The sexless rule set was dominated by chronic renal disease among individuals ages 65-80, with lift values ranging from 3.86 to 3.92. These rules had slightly higher lift than the 81+ age group rules, where lift ranged from about 3.60 to 3.78.
+
+The 51-64 age group also appeared several times, mostly with chronic renal disease combined with diabetes or hypertension. Overall, the sexless rules suggest that age group and chronic renal disease were among the strongest association patterns for adverse outcomes.
+
+The top 25 rules had lift values ranging from 3.55 to 4.05 when sex was included, and support ranged from 0.002 to 0.012. This indicates that the strongest rules represented small but high-risk subgroups. Because the full rule plots were crowded, Figures 7-10 separate the association rule results by sex, age group, sex-excluded patterns, and selected conditions.
+
+```{r}
+all_lift <- rules_top@quality$lift
+lift_min <- min(all_lift)
+lift_max <- max(all_lift)
+
+all_support <- rules_top@quality$support
+support_min <- min(all_support)
+support_max <- max(all_support)
+
+all_confidence <- rules_top@quality$confidence
+confidence_min <- min(all_confidence)
+confidence_max <- max(all_confidence)
+
+all_lift_f <- rules@quality$lift
+lift_min_f <- min(all_lift_f)
+lift_max_f <- max(all_lift_f)
+
+all_support_f <- rules@quality$support
+support_min_f <- min(all_support_f)
+support_max_f <- max(all_support_f)
+
+all_confidence_f <- rules@quality$confidence
+confidence_min_f <- min(all_confidence_f)
+confidence_max_f <- max(all_confidence_f)
+```
+
+```{r}
+lift_breaks_f <- quantile(
+  all_lift_f,
+  probs = seq(0, 1, length.out = 9),
+  na.rm = TRUE
+)
+
+lift_labels_f <- paste0(
+  round(head(lift_breaks_f, -1), 2),
+  " - ",
+  round(tail(lift_breaks_f, -1), 2)
+)
+
+lift_colors_f <- setNames(
+  c(
+    "#4d4d4d",
+    "#1a1a1a",
+    "#000000",
+    "#330000",
+    "#800000",
+    "#cc0000",
+    "#ff3300",
+    "#ff8c00"
+  ),
+  lift_labels_f
+)
+
+lift_scale_f <- scale_color_manual(
+  values = lift_colors_f,
+  limits = lift_labels_f,
+  breaks = lift_labels_f,
+  drop = FALSE,
+  name = "Lift"
+)
+
+top25_cutoff <- confidence_min
+top25_lift <- round(lift_min,3)
+
+lift_breaks <- quantile(
+  all_lift,
+  probs = seq(0, 1, length.out = 7),
+  na.rm = TRUE
+)
+lift_labels <- paste0(
+  round(head(lift_breaks, -1), 2),
+  " - ",
+  round(tail(lift_breaks, -1), 2)
+)
+lift_colors <- setNames(
+  c(
+    "#000000",  # black (lowest)
+    "#330000",  # very dark red
+    "#800000",  # dark red
+    "#cc0000",  # red
+    "#ff3300",  # red-orange
+    "#ff8c00"   # orange (highest)
+  ),
+  lift_labels
+)
+
+lift_scale <- scale_color_manual(
+  values = lift_colors,
+  limits = lift_labels,
+  breaks = lift_labels,
+  drop = FALSE,
+  name = "Lift"
+)
+```
+
+```{r}
+rules_female <- subset(rules, lhs %ain% "Sex=Female")
+
+rules_df <- as(rules_female, "data.frame")
+
+rules_df <- rules_df %>%
+  arrange(desc(lift))
+
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+rules_df$rhs <- sub(".*=> ", "", rules_df$rules)
+```
+
+The highest-ranking female rules generally involved chronic renal disease combined with one or two additional conditions, with lift values around 3.5. Among females ages 81+, hypertension also appeared as an important rule, with a lift of approximately 3.4.
+
+```{r}
+rules_df <- as(rules_female, "data.frame")
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+
+rules_df$lift_group <- cut(
+  rules_df$lift,
+  breaks = lift_breaks_f,
+  include.lowest = TRUE,
+  labels = lift_labels_f
+)
+rules_df$lift_group <- factor(rules_df$lift_group, levels = lift_labels_f)
+
+rules_df$label <- gsub("Sex=Female,", "", rules_df$lhs)
+females <- rules_df$label
+
+
+p3 <- ggplot(rules_df, aes(support, confidence, color = lift_group)) + 
+coord_cartesian(
+  xlim = c(support_min_f, support_max_f),
+  ylim = c(confidence_min_f, confidence_max_f),
+  clip = "off"
+) +
+  geom_point(show.legend = TRUE) +
+  geom_hline(yintercept =  top25_cutoff) +
+  geom_text_repel(
+  aes(label = label),
+  size = 3,
+  nudge_x = (support_max_f - support_min_f) * 0.01,
+  direction = "both",
+  max.overlaps = Inf,
+  show.legend = FALSE
+) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(n = 8)
+  ) +
+  labs(title = "Female Group",
+    x = "Support",
+    y = "Confidence",
+    color = "Lift"
+  ) +
+  annotate(
+  "text",
+  x = support_max_f,
+  y =  confidence_min,
+  label = paste0("Global Top 25 cutoff (with sex) Lift = ", top25_lift),
+  hjust = 1.1,
+  vjust = -0.5,
+  size = 3
+) +
+  lift_scale_f +
+  theme_minimal() +
+  theme(
+    plot.margin = margin(5, 5, 5, 5)
+  )
+```
+
+```{r}
+rules_male <- subset(rules, lhs %ain% "Sex=Male")
+
+rules_df <- as(rules_male, "data.frame")
+
+rules_df <- rules_df %>%
+  arrange(desc(lift))
+
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+rules_df$rhs <- sub(".*=> ", "", rules_df$rules)
+```
+
+```{r}
+rules_df <- as(rules_male, "data.frame")
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+
+rules_df$lift_group <- cut(
+  rules_df$lift,
+  breaks = lift_breaks_f,
+  include.lowest = TRUE,
+  labels = lift_labels_f
+)
+rules_df$lift_group <- factor(rules_df$lift_group, levels = lift_labels_f)
+
+rules_df$label <- gsub("Sex=Male,", "", rules_df$lhs)
+males <- rules_df$label
+
+
+p4 <- ggplot(rules_df, aes(support, confidence, color = lift_group)) + 
+coord_cartesian(
+  xlim = c(support_min_f, support_max_f),
+  ylim = c(confidence_min_f, confidence_max_f),
+  clip = "off"
+) +
+  geom_point(show.legend = TRUE) +
+  geom_hline(yintercept =  top25_cutoff) +
+  geom_text_repel(
+  aes(label = label),
+  size = 3,
+  nudge_x = (support_max_f - support_min_f) * 0.01,
+  direction = "both",
+  max.overlaps = Inf,
+  show.legend = FALSE
+) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(n = 8)
+  ) +
+  labs(title = "Male Group",
+    x = "Support",
+    y = "Confidence",
+    color = "Lift"
+  ) +
+  lift_scale_f +
+  theme_minimal() +
+  theme(
+    plot.margin = margin(5, 5, 5, 5)
+  )
+```
+
+```{r fig.cap="Figure 7. Association rules by sex."}
+sex_plot <- p3 + p4 + plot_layout(ncol = 2, guides = "collect")
+sex_plot
+```
+
+Of the 52 generated rules, 7 involved females and 18 involved males. Male rules were more common and stronger: 12 appeared in the global top 25, while no female rules appeared in that group.
+
+Males ages 65-80 had nearly the same lift as females ages 81+, regardless of additional conditions, with lift values of approximately 3.26 and 3.24. Most female rules also appeared among the male rules, but the corresponding male rules had higher lift values. The only female-specific rule involved females ages 65-80 with obesity, diabetes, and hypertension, with a lift of about 3.3.
+
+Additional male patterns included tobacco use among males ages 65-80, with a lift near 3.5, and diabetes with chronic renal disease among males ages 51-64, with a lift around 3.75.
+
+```{r}
+ggsave(
+  "fig7-sex_plot.png",
+  plot = sex_plot,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+```
+
+```{r}
+all_lift_x <- rules_top_sexless@quality$lift
+lift_min_x <- min(all_lift_x)
+lift_max_x <- max(all_lift_x)
+
+all_support_x <- rules_top_sexless@quality$support
+support_min_x <- min(all_support_x)
+support_max_x <- max(all_support_x)
+
+all_confidence_x <- rules_top_sexless@quality$confidence
+confidence_min_x <- min(all_confidence_x)
+confidence_max_x <- max(all_confidence_x)
+
+all_coverage_x <- rules_top_sexless@quality$coverage
+coverage_min_x <- min(all_coverage_x)
+coverage_max_x <- max(all_coverage_x)
+
+lift_breaks_x <- quantile(
+  all_lift_x,
+  probs = seq(0, 1, length.out = 7),
+  na.rm = TRUE
+)
+
+lift_labels_x <- paste0(
+  round(head(lift_breaks_x, -1), 2),
+  " - ",
+  round(tail(lift_breaks_x, -1), 2)
+)
+
+lift_colors_x <- setNames(
+  c(
+    "#000000",  # black (lowest)
+    "#330000",  # very dark red
+    "#800000",  # dark red
+    "#cc0000",  # red
+    "#ff3300",  # red-orange
+    "#ff8c00"   # orange (highest)
+  ),
+  lift_labels_x
+)
+
+lift_scale_x <- scale_color_manual(
+  values = lift_colors_x,
+  limits = lift_labels_x,
+  breaks = lift_labels_x,
+  drop = FALSE,
+  name = "Lift"
+)
+```
+
+```{r fig.cap="Figure 8. Top association rules excluding sex."}
+rules_df <- as(rules_top_sexless, "data.frame")
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+rules_df$label <- rules_df$lhs
+
+rules_df$lift_group <- cut(
+  rules_df$lift,
+  breaks = lift_breaks_x,
+  include.lowest = TRUE,
+  labels = lift_labels_x
+)
+
+rules_df$lift_group <- factor(rules_df$lift_group, levels = lift_labels_x)
+
+plot_rules_x <- ggplot(rules_df, aes(support, confidence, color = lift_group)) + 
+  coord_cartesian(
+    xlim = c(support_min_x, support_max_x),
+    ylim = c(confidence_min_x, confidence_max_x)
+  ) +
+  geom_hline(yintercept =  top25_cutoff) +
+  geom_point() +
+  geom_text_repel(
+    aes(label = label),
+    size = 3,
+    nudge_x = (support_max_x - support_min_x) * 0.01
+  ) +
+  annotate(
+  "text",
+  x = support_max_x,
+  y =  confidence_min,
+  label = paste0("Global Top 25 cutoff (with sex) Lift = ", top25_lift),
+  hjust = 1.1,
+  vjust = -0.5,
+  size = 3
+) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 8)) +
+  lift_scale_x +
+  labs(
+    title = "Top 25 Rules for Adverse Outcome (without sex)",
+    x = "Support",
+    y = "Confidence",
+    color = "Lift"
+  ) +
+  theme_minimal()
+
+plot_rules_x
+```
+
+
+```{r}
+ggsave(
+  "fig8-xless_plot.png",
+  plot = plot_rules_x,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+```
+
+The black reference line marks the minimum lift value for the global top 25 rules when sex was included. Figures 9-10 use the same x- and y-axis limits for comparison, but the reference line is removed.
+
+When sex was excluded, maximum support increased from 0.012 to 0.022, while minimum lift decreased from 3.55 to 3.31. The highest-lift rules were still driven mainly by age group and pre-existing conditions. Tobacco use among individuals ages 65-80 also appeared, with lift values around 3.4 to 3.5.
+
+The following age-group comparisons show how these rule patterns differ across the 51-64, 65-80, and 81+ groups.
+
+```{r}
+rules_oldest <- subset(rules_top_sexless, lhs %ain% "Age_Group=81+")
+
+rules_df <- as(rules_oldest, "data.frame")
+
+rules_df <- rules_df %>%
+  arrange(desc(lift))
+
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+rules_df$rhs <- sub(".*=> ", "", rules_df$rules)
+```
+
+
+```{r}
+rules_df <- as(rules_oldest, "data.frame")
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+
+rules_df$label <- gsub(",Age_Group=81+", "", rules_df$lhs)
+
+rules_df$lift_group <- cut(
+  rules_df$lift,
+  breaks = lift_breaks_x,
+  include.lowest = TRUE,
+  labels = lift_labels_x
+)
+
+rules_df$lift_group <- factor(rules_df$lift_group, levels = lift_labels_x)
+
+p0 <- ggplot(rules_df, aes(support, confidence, color = lift_group)) + 
+coord_cartesian(
+  xlim = c(support_min_x, support_max_x),
+  ylim = c(confidence_min_x, confidence_max_x),
+  clip = "off"
+) +
+  geom_point(show.legend = TRUE) +
+  geom_text_repel(
+  aes(label = label),
+  size = 3,
+  nudge_x = (support_max_x-support_min_x)*0.01,
+  direction = "both",
+  max.overlaps = Inf,
+  show.legend = FALSE
+) +
+  labs(title = "81+ Age Group",
+    x = "Support",
+    y = "Confidence",
+    color = "Lift"
+  ) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(n = 8)
+  ) +
+  lift_scale_x +
+  theme_minimal() +
+  theme(
+    plot.margin = margin(5, 5, 5, 5)
+  )
+```
+
+```{r}
+rules_older <- subset(rules_top_sexless, lhs %ain% "Age_Group=65-80")
+
+rules_df <- as(rules_older, "data.frame")
+
+rules_df <- rules_df %>%
+  arrange(desc(lift))
+
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+rules_df$rhs <- sub(".*=> ", "", rules_df$rules)
+```
+
+```{r}
+rules_df <- as(rules_older, "data.frame")
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+
+rules_df$label <- gsub(",Age_Group=65-80", "", rules_df$lhs)
+
+rules_df$lift_group <- cut(
+  rules_df$lift,
+  breaks = lift_breaks_x,
+  include.lowest = TRUE,
+  labels = lift_labels_x
+)
+
+rules_df$lift_group <- factor(rules_df$lift_group, levels = lift_labels_x)
+
+p1 <- ggplot(rules_df, aes(support, confidence, color = lift_group)) + 
+coord_cartesian(
+  xlim = c(support_min_x, support_max_x),
+  ylim = c(confidence_min_x, confidence_max_x),
+  clip = "off"
+) +
+  geom_point(show.legend = TRUE) +
+  geom_text_repel(
+  aes(label = label),
+  size = 3,
+  nudge_x = (support_max_x-support_min_x)*0.01,
+  direction = "both",
+  max.overlaps = Inf,
+  show.legend = FALSE
+) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(n = 8)
+  ) +
+  labs(title = "65-80 Age Group",
+    x = "Support",
+    y = "Confidence",
+    color = "Lift"
+  ) +
+  lift_scale_x +
+  theme_minimal() +
+  theme(
+    plot.margin = margin(5, 5, 5, 5)
+  )
+```
+
+```{r}
+rules_middle <- subset(rules_top_sexless, lhs %ain% "Age_Group=51-64")
+rules_df <- as(rules_middle, "data.frame")
+
+rules_df <- rules_df %>%
+  arrange(desc(lift))
+
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+rules_df$rhs <- sub(".*=> ", "", rules_df$rules)
+```
+
+```{r}
+rules_lhs <- labels(lhs(rules_top_sexless))
+
+rules_no_age <- rules_top_sexless[
+  !grepl("Age_Group=", rules_lhs)
+]
+
+rules_df <- as(rules_no_age, "data.frame") %>%
+  mutate(
+    lhs = sub(" =>.*", "", rules),
+    rhs = sub(".*=> ", "", rules)
+  ) %>%
+  arrange(desc(lift)) %>%
+  select(lhs, support, confidence, lift)
+```
+
+
+```{r}
+rules_df <- as(rules_middle, "data.frame")
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+
+rules_df$label <- gsub(",Age_Group=51-64", "", rules_df$lhs)
+
+rules_df$lift_group <- cut(
+  rules_df$lift,
+  breaks = lift_breaks_x,
+  include.lowest = TRUE,
+  labels = lift_labels_x
+)
+
+rules_df$lift_group <- factor(rules_df$lift_group, levels = lift_labels_x)
+
+p2 <- ggplot(rules_df, aes(support, confidence, color = lift_group)) + 
+coord_cartesian(
+  xlim = c(support_min_x, support_max_x),
+  ylim = c(confidence_min_x, confidence_max_x),
+  clip = "off"
+) +
+  geom_point(show.legend = TRUE) +
+  geom_text_repel(
+  aes(label = label),
+  size = 3,
+  nudge_x = (support_max_x-support_min_x)*0.01,
+  direction = "both",
+  max.overlaps = Inf,
+  show.legend = FALSE
+) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(n = 8)
+  ) +
+  lift_scale_x +
+    labs(title = "51-64 Age Group",
+    x = "Support",
+    y = "Confidence",
+    color = "Lift"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.margin = margin(5, 5, 5, 5)
+  )
+```
+
+```{r fig.cap="Figure 9. Association rules by age group."}
+age_plot <- p2 + p1 + plot_layout(ncol = 2, guides = "collect") 
+age_plot
+```
+
+
+Across the age-specific rules, chronic renal disease was the most consistent high-lift condition. In the 65-80 group, many top rules involved chronic renal disease alone or combined with diabetes or hypertension, with lift values around 3.86 to 3.92. The 51-64 group appeared less often, but its strongest rules showed the same chronic renal disease pattern, with lift values around 3.63 to 3.77.
+
+For the 81+ group, age alone had a high lift of approximately 3.60, while adding diabetes, hypertension, or both increased lift to approximately 3.71 to 3.78. However, only four rules were generated for this group, suggesting that rarer conditions may not have met the minimum support threshold. Figure 9 shows that chronic renal disease among individuals ages 65-80 had higher lift than any 81+ rule, suggesting that chronic renal disease identified a particularly high-risk subgroup before the oldest age category.
+
+```{r}
+ggsave(
+  "fig9-age_plot.png",
+  plot = age_plot,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+```
+
+```{r}
+rules_kidney <- subset(rules_top_sexless, lhs %ain% "Chronic_Renal_Disease")
+
+rules_df <- as(rules_kidney, "data.frame")
+
+rules_df <- rules_df %>%
+  arrange(desc(lift))
+
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+rules_df$rhs <- sub(".*=> ", "", rules_df$rules)
+```
+
+
+```{r}
+rules_df <- as(rules_kidney, "data.frame")
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+
+rules_df$label <- gsub("?Chronic_Renal_Disease?", "", rules_df$lhs)
+
+rules_df$lift_group <- cut(
+  rules_df$lift,
+  breaks = lift_breaks_x,
+  include.lowest = TRUE,
+  labels = lift_labels_x
+)
+
+rules_df$lift_group <- factor(rules_df$lift_group, levels = lift_labels_x)
+
+p7 <- ggplot(rules_df, aes(support, confidence, color = lift_group)) + 
+coord_cartesian(
+  xlim = c(support_min_x, support_max_x),
+  ylim = c(confidence_min_x, confidence_max_x),
+  clip = "off"
+) +
+  geom_point(show.legend = TRUE) +
+  geom_text_repel(
+  aes(label = label),
+  size = 3,
+  nudge_x = (support_max_x-support_min_x)*0.01,
+  direction = "both",
+  max.overlaps = Inf,
+  show.legend = FALSE
+) +
+  labs(title = "Chronic Renal Disease",
+    x = "Support",
+    y = "Confidence",
+    color = "Lift"
+  ) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(n = 8)
+  ) +
+  lift_scale_x +
+  theme_minimal() +
+  theme(
+    plot.margin = margin(5, 5, 5, 5)
+  )
+```
+
+```{r}
+rules_obesity <- subset(rules_top_sexless, lhs %ain% "Obesity")
+
+rules_df <- as(rules_obesity, "data.frame")
+
+rules_df <- rules_df %>%
+  arrange(desc(lift))
+
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+rules_df$rhs <- sub(".*=> ", "", rules_df$rules)
+
+rules_df <- rules_df[, c("lhs", "support", "confidence", "lift")]
+```
+
+Among the top 25 rules, chronic renal disease appeared more often and with stronger lift values than obesity. Nine rules involved chronic renal disease, often combined with diabetes, hypertension, or both. In contrast, only three rules involved obesity, all among individuals ages 65-80 with diabetes, hypertension, or both, with lift values ranging from approximately 3.37 to 3.50.
+
+```{r}
+rules_df <- as(rules_obesity, "data.frame")
+rules_df$lhs <- sub(" =>.*", "", rules_df$rules)
+
+rules_df$label <- gsub("?Obesity?", "", rules_df$lhs)
+
+rules_df$lift_group <- cut(
+  rules_df$lift,
+  breaks = lift_breaks_x,
+  include.lowest = TRUE,
+  labels = lift_labels_x
+)
+
+rules_df$lift_group <- factor(rules_df$lift_group, levels = lift_labels_x)
+
+p8 <- ggplot(rules_df, aes(support, confidence, color = lift_group)) + 
+coord_cartesian(
+  xlim = c(support_min_x, support_max_x),
+  ylim = c(confidence_min_x, confidence_max_x),
+  clip = "off"
+) +
+  geom_point(show.legend = TRUE) +
+  geom_text_repel(
+  aes(label = label),
+  size = 3,
+  nudge_x = (support_max_x-support_min_x)*0.01,
+  direction = "both",
+  max.overlaps = Inf,
+  show.legend = FALSE
+) +
+  labs(title = "Obesity Group",
+    x = "Support",
+    y = "Confidence",
+    color = "Lift"
+  ) +
+  scale_x_continuous(
+    breaks = scales::pretty_breaks(n = 8)
+  ) +
+  lift_scale_x+
+  theme_minimal() +
+  theme(
+    plot.margin = margin(5, 5, 5, 5)
+  )
+```
+
+```{r fig.cap="Figure 10. Rules involving chronic renal disease and obesity."}
+### Plot for Renal Chronic x Obesity
+condition_plot2 <- p7 + p8 + plot_layout(ncol = 2, guides = "collect")
+condition_plot2
+```
+
+Figure 10 shows that chronic renal disease had stronger and more varied rule patterns than obesity. Chronic renal disease appeared across more rules, including combinations with diabetes, hypertension, and age groups 51-64 and 65-80. Its rules also had higher confidence and lift overall, with the strongest rules reaching lift values near 3.9.
+
+Obesity appeared in fewer rules, all limited to individuals ages 65-80 with diabetes, hypertension, or both. These rules had lower confidence and lift, with lift values around 3.4 to 3.5.
+
+```{r}
+ggsave(
+  "fig10-condition_plot2.png",
+  plot = condition_plot2,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+```
+
+### 6.3 Interpretation for Modeling
+
+Association rule mining was useful as an exploratory bridge between EDA and supervised modeling. It identified repeated high-risk patterns involving chronic renal disease, diabetes, hypertension, sex, tobacco use, and older age groups. These findings helped guide the interaction terms tested in logistic regression, while random forest provided a more flexible predictive comparison.
+
+Based on EDA and association rule mining, selected interaction terms were added to the logistic regression models: `Diabetes:Hypertension`, `Sex:Diabetes`, `Sex:Hypertension`, `Sex:Age`, `Tobacco:Age`, and `Other_Disease:Age`. The `Diabetes:Obesity` interaction was tested but removed because it was not statistically significant in the logistic regression model.
+
+## 7. Supervised Modeling Results
+
+The target variable showed moderate class imbalance, with adverse outcomes representing 15.4% of observations. To address this, hybrid sampling was applied to the training data only, using minority-class oversampling and majority-class undersampling to create a 2:1 non-adverse to adverse outcome ratio.
+
+The test set was not resampled, so model performance was evaluated on the original outcome distribution. Because of the class imbalance, ROC AUC, sensitivity, specificity, and F1-score were emphasized over accuracy alone.
+
+```{r}
+make_roc_plot <- function(truth, prob, title_text, line_color = "blue") {
+  roc_obj <- roc(truth, prob, levels = c("No", "Yes"), direction = "<")
+  auc_val <- round(auc(roc_obj), 4)
+  
+  roc_df <- data.frame(
+    fpr = 1 - roc_obj$specificities,
+    tpr = roc_obj$sensitivities
+  )
+  
+  ggplot(roc_df, aes(x = fpr, y = tpr)) +
+    geom_line(color = line_color, linewidth = 1.2) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+    labs(
+      title = title_text,
+      x = "False Positive Rate",
+      y = "True Positive Rate"
+    ) +
+    annotate("text", x = 0.65, y = 0.1, label = paste("AUC =", auc_val), size = 4) +
+    coord_equal() +
+    theme_minimal() +
+  theme(
+    plot.margin = margin(5, 5, 5, 5)
+  )
+}
+```
+
+```{r}
+df_all_features <- cleaned_df
+```
+
+```{r}
+set.seed(8675309)
+
+split_full <- initial_split(df_all_features, prop = 0.8, strata = Adverse_Outcome)
+train_full <- training(split_full)
+test_full <- testing(split_full)
+```
+
+```{r}
+set.seed(8675309)
+
+minority_n <- sum(train_full$Adverse_Outcome == "Yes") * 2
+majority_n <- minority_n * 2
+
+train_down_full <- train_full %>%
+  filter(Adverse_Outcome == "No") %>%
+  slice_sample(n = majority_n)
+
+train_up_full <- train_full %>%
+  filter(Adverse_Outcome == "Yes") %>%
+  slice_sample(
+    n = minority_n,
+    replace = TRUE
+  )
+
+train_combined_full <- bind_rows(train_down_full, train_up_full)
+```
+
+```{r}
+set.seed(8675309)
+
+split_reduced <- initial_split(df_nzv_removed, prop = 0.8, strata = Adverse_Outcome)
+train_reduced <- training(split_reduced)
+test_reduced <- testing(split_reduced)
+```
+
+```{r}
+set.seed(8675309)
+
+train_down_reduced <- train_reduced %>%
+  filter(Adverse_Outcome == "No") %>%
+  slice_sample(n = majority_n)
+
+train_up_reduced <- train_reduced %>%
+  filter(Adverse_Outcome == "Yes") %>%
+  slice_sample(
+    n = minority_n,
+    replace = TRUE
+  )
+
+train_combined_reduced <- bind_rows(train_down_reduced, train_up_reduced)
+```
+
+```{r}
+test_full <- test_full %>%
+  select(-c(Pneumonia, Hospitalized, Age_Group, Pregnant, No_Conditions))
+train_combined_full <- train_combined_full %>%
+    select(-c(Pneumonia, Hospitalized, Age_Group, Pregnant, No_Conditions))
+test_reduced <- test_reduced %>%
+  select(-c(Pneumonia, Hospitalized, Age_Group, No_Conditions))
+train_combined_reduced <- train_combined_reduced %>%
+  select(-c(Pneumonia, Hospitalized, Age_Group, No_Conditions))
+```
+
+### 7.1 Logistic Regression
+
+Logistic regression was selected because it is commonly used in COVID-19 severity research and provides interpretable coefficients. These coefficients estimate changes in the log-odds of adverse outcome while holding other variables constant. Its main limitation is that nonlinear patterns and interaction effects must be specified manually.
+
+```{r, include=FALSE}
+#### Without Interaction Effects
+log_full <- glm(Adverse_Outcome ~., data = train_combined_full, family = "binomial")
+summary(log_full)
+coef_values_full <- coef(log_full)
+```
+
+```{r, include=FALSE}
+pred_log_full <- predict(log_full, newdata = test_full, type = "response")
+pred2 <- ifelse(pred_log_full>=0.75, "Yes", "No") # Cutoff can be adjusted from 0.5
+pred2 <- factor(pred2, levels = c("No", "Yes"))
+
+confusionMatrix(pred2, test_full$Adverse_Outcome, positive = "Yes", mode = "everything") # mode = "everything" includes f1 score
+```
+
+```{r, include=FALSE}
+#### With Interaction Effects
+log_full_interaction <- glm(Adverse_Outcome ~ . + Diabetes:Hypertension + Sex:Diabetes + Sex:Hypertension + Sex:Age + Tobacco:Age + Other_Disease:Age,  data = train_combined_full, family = "binomial")
+summary(log_full_interaction)
+coef_values_int <- coef(log_full_interaction)
+```
+
+```{r, include=FALSE}
+pred_log_full_int <- predict(log_full_interaction, newdata = test_full, type = "response")
+pred2 <- ifelse(pred_log_full_int >= 0.75, "Yes", "No")
+pred2 <- factor(pred2, levels = c("No", "Yes"))
+confusionMatrix(pred2, test_full$Adverse_Outcome, positive = "Yes", mode = "everything")
+```
+
+```{r, include=FALSE}
+###  Reduced Dataset (Near-Zero Variance Removed)
+#### Without Interaction Effects
+log_reduced <- glm(Adverse_Outcome ~ ., data = train_combined_reduced, family = "binomial")
+summary(log_reduced)
+coef_values <- coef(log_reduced)
+```
+
+```{r, include=FALSE}
+coef_table <- tibble(
+  Term = names(coef_values),
+  Coefficient = as.numeric(coef_values),
+  Abs_Coefficient = abs(as.numeric(coef_values))
+) %>%
+  arrange(desc(Abs_Coefficient))
+
+head(coef_table, 10)
+```
+
+```{r, include=FALSE}
+pred_log_reduced <- predict(log_reduced, newdata = test_reduced, type = "response")
+pred2 <- ifelse(pred_log_reduced >= 0.75, "Yes", "No")
+pred2 <- factor(pred2, levels = c("No", "Yes"))
+confusionMatrix(pred2, test_reduced$Adverse_Outcome, positive = "Yes", mode = "everything")
+```
+
+```{r, include=FALSE}
+#### With Interaction Effects
+log_reduced_interaction <- glm(Adverse_Outcome ~ . + Diabetes:Hypertension + Sex:Diabetes + Sex:Hypertension + Sex:Age, data = train_combined_reduced, family = "binomial")
+summary(log_reduced_interaction)
+coef_values <- coef(log_reduced_interaction)
+```
+
+```{r, include=FALSE}
+coef_table <- tibble(
+  Term = names(coef_values),
+  Coefficient = as.numeric(coef_values),
+  Abs_Coefficient = abs(as.numeric(coef_values))
+) %>%
+  arrange(desc(Abs_Coefficient))
+
+head(coef_table, 10)
+```
+
+```{r, include=FALSE}
+pred_log_reduced_int <- predict(log_reduced_interaction, newdata = test_reduced, type = "response")
+pred2 <- ifelse(pred_log_reduced_int >= 0.75, "Yes", "No") # Cutoff can be adjusted from 0.5
+pred2 <- factor(pred2, levels = c("No", "Yes"))
+confusionMatrix(pred2, test_reduced$Adverse_Outcome, positive = "Yes", mode = "everything")
+```
+
+Based on EDA and association rule mining, selected interaction terms were added to the logistic regression models. All four logistic regression models performed similarly. After testing several classification thresholds, a cutoff of 0.75 was used because it reduced the error rate from about 0.17 to 0.15 while maintaining a reasonable balance across evaluation metrics.
+
+### 7.2 Random Forest
+
+Random forest was selected as a nonlinear tree-based ensemble model that can capture complex relationships and interactions. It also provides variable importance measures for interpretation. Its main limitation is lower interpretability compared with logistic regression coefficients.
+
+```{r, include=FALSE}
+response <- "Adverse_Outcome"
+n_features <- length(setdiff(names(train_combined_full), response))
+
+rf1 <- ranger(
+  Adverse_Outcome ~.,
+  data = train_combined_full,
+  mtry = floor(sqrt(n_features)),
+  respect.unordered.factors = "order",
+  probability = TRUE,
+  seed = 8675309
+)
+default_error_rate <- rf1$prediction.error
+cat("Default OOB Error Rate:",default_error_rate)
+```
+
+Hyperparameter tuning used grid search over four random forest parameters: `mtry`, `min.node.size`, `replace`, and `sample.fraction`. The `mtry` values were set to 5%, 25%, and 40% of the number of predictors, rounded up. Minimum node size was tested at 1, 5, and 10. Sampling was tested both with and without replacement, and sample fractions of 0.50 and 0.80 were compared. This produced 36 candidate models. The number of trees was set to `n_features * 10` to manage runtime, and the final tuned model was selected using the lowest out-of-bag error rate.
+
+```{r, include=FALSE}
+hyper_grid <- expand.grid(
+  mtry = ceiling(n_features * c(.05, .25, .4)),
+  min.node.size = c(1,5,10),
+  replace = c(TRUE, FALSE),
+  sample.fraction = c(.5, .8),
+  error_rate = NA
+)
+
+set.seed(8675309)
+for(i in seq_len(nrow(hyper_grid))){
+  cat("Running model", i, "of", nrow(hyper_grid), "\n")
+  
+  fit <- ranger(
+    formula = Adverse_Outcome ~ .,
+    data = train_combined_full,
+    num.trees = n_features * 10,
+    mtry = hyper_grid$mtry[i],
+    min.node.size = hyper_grid$min.node.size[i],
+    sample.fraction = hyper_grid$sample.fraction[i],
+    replace = hyper_grid$replace[i],
+    verbose = FALSE,
+    seed = 8675309
+  )
+  hyper_grid$error_rate[i] <- fit$prediction.error
+}
+```
+
+```{r, include=FALSE}
+best_parms1 <- hyper_grid %>%
+  arrange(error_rate) %>%
+  slice(1)
+best_parms1
+```
+
+```{r, include=FALSE}
+rf1_tuned <- ranger(
+  formula = Adverse_Outcome ~ .,
+  data = train_combined_full,
+  num.trees = n_features * 10,
+  mtry = best_parms1$mtry,
+  min.node.size = best_parms1$min.node.size,
+  sample.fraction = best_parms1$sample.fraction,
+  replace = best_parms1$replace,
+  importance = "impurity",
+  probability = TRUE,
+  verbose = FALSE,
+  seed = 8675309,
+  respect.unordered.factors = "order"
+)
+tuned_error_rate <- rf1_tuned$prediction.error
+cat("Tuned OOB Error Rate:",tuned_error_rate)
+```
+
+```{r, include=FALSE}
+#### Reduced dataset Near-Zero Variance removed
+n_features_reduced <- length(setdiff(names(train_combined_reduced), "Adverse_Outcome"))
+
+rf2 <- ranger(
+  Adverse_Outcome ~.,
+  data = train_combined_reduced,
+  mtry = floor(sqrt(n_features_reduced)),
+  respect.unordered.factors = "order",
+  probability = TRUE,
+  seed = 8675309
+)
+default_error_rate <- rf2$prediction.error
+cat("Default OOB Error Rate:",default_error_rate)
+```
+
+```{r, include=FALSE}
+hyper_grid_reduced <- expand.grid(
+  mtry = ceiling(n_features_reduced * c(.05, .25, .4)),
+  min.node.size = c(1, 5, 10),
+  replace = c(TRUE, FALSE),
+  sample.fraction = c(.5, .8),
+  error_rate = NA
+)
+
+set.seed(8675309)
+for(i in seq_len(nrow(hyper_grid))){
+  cat("Running model", i, "of", nrow(hyper_grid_reduced), "\n")
+  
+  fit <- ranger(
+    formula = Adverse_Outcome ~ .,
+    data = train_combined_reduced,
+    num.trees = n_features_reduced * 10,
+    mtry = hyper_grid_reduced$mtry[i],
+    min.node.size = hyper_grid_reduced$min.node.size[i],
+    sample.fraction = hyper_grid_reduced$sample.fraction[i],
+    replace = hyper_grid_reduced$replace[i],
+    importance = "impurity",
+    probability = TRUE,
+    verbose = FALSE,
+    seed = 8675309
+  )
+  hyper_grid_reduced$error_rate[i] <- fit$prediction.error
+}
+```
+
+```{r, include=FALSE}
+best_parms2 <- hyper_grid %>%
+  arrange(error_rate) %>%
+  slice(1)
+best_parms2
+```
+
+```{r, include=FALSE}
+rf2_tuned <- ranger(
+  formula = Adverse_Outcome ~ .,
+  data = train_combined_reduced,
+  num.trees = n_features_reduced * 10,
+  mtry = best_parms2$mtry,
+  min.node.size = best_parms2$min.node.size,
+  sample.fraction = best_parms2$sample.fraction,
+  replace = best_parms2$replace,
+  importance = "impurity",
+  verbose = FALSE,
+  probability = TRUE,
+  seed = 8675309,
+  respect.unordered.factors = "order"
+)
+tuned_error_rate <- rf2_tuned$prediction.error
+cat("Tuned OOB Error Rate:",tuned_error_rate)
+```
+
+```{r, include=FALSE}
+### Random Forest All Features (Full Dataset) Untuned
+rf1_pred_prob <- predict(rf1, data = test_full)$predictions[, "Yes"]
+pred_class <- factor(
+  ifelse(rf1_pred_prob > 0.5, "Yes", "No"),
+  levels = levels(test_full$Adverse_Outcome)
+)
+confusionMatrix(
+  pred_class,
+  test_full$Adverse_Outcome,
+  positive = "Yes",
+  mode = "everything"
+)
+```
+
+```{r, include=FALSE}
+### Random Forest All Features (Full Dataset) Tuned
+rf1_tuned_pred_prob <- predict(rf1_tuned, data = test_full)$predictions[, "Yes"]
+pred_class <- factor(
+  ifelse(rf1_tuned_pred_prob > 0.5, "Yes", "No"),
+  levels = levels(test_full$Adverse_Outcome)
+)
+confusionMatrix(
+  pred_class,
+  test_full$Adverse_Outcome,
+  positive = "Yes",
+  mode = "everything"
+)
+```
+
+```{r, include=FALSE}
+### Random Forest Reduced Dataset (Near-Zero Variance Removed) Untuned
+rf2_pred_prob <- predict(rf2, data = test_reduced)$predictions[, "Yes"]
+pred_class <- factor(
+  ifelse(rf2_pred_prob > 0.5, "Yes", "No"),
+  levels = levels(test_reduced$Adverse_Outcome)
+)
+confusionMatrix(
+  pred_class,
+  test_reduced$Adverse_Outcome,
+  positive = "Yes",
+  mode = "everything"
+)
+```
+
+```{r, include=FALSE}
+### Random Forest Reduced Dataset (Near-Zero Variance Removed) Tuned
+rf2_tuned_pred_prob <- predict(rf2_tuned, data = test_reduced)$predictions[, "Yes"]
+pred_class <- factor(
+  ifelse(rf2_tuned_pred_prob > 0.5, "Yes", "No"),
+  levels = levels(test_reduced$Adverse_Outcome)
+)
+confusionMatrix(
+  pred_class,
+  test_reduced$Adverse_Outcome,
+  positive = "Yes",
+  mode = "everything"
+)
+```
+
+### 7.3 Evaluation and Comparison
+
+```{r}
+p1 <- make_roc_plot(
+  truth = test_full$Adverse_Outcome,
+  prob = pred_log_full,
+  title_text = "LR Full"
+)
+
+p2 <- make_roc_plot(
+  truth = test_full$Adverse_Outcome,
+  prob = pred_log_full_int,
+  title_text = "LR Full + Interactions"
+)
+
+p3 <- make_roc_plot(
+  truth = test_reduced$Adverse_Outcome,
+  prob = pred_log_reduced,
+  title_text = "LR Reduced"
+)
+
+p4 <- make_roc_plot(
+  truth = test_reduced$Adverse_Outcome,
+  prob = pred_log_reduced_int,
+  title_text = "LR Reduced + Interactions"
+)
+```
+
+```{r fig.cap="Figure 11. Logistic regression ROC curves."}
+fig1 <- (p1 + p2 + p3 + p4 + plot_layout(ncol = 2, guides = "collect"))
+fig1
+```
+
+```{r}
+ggsave(
+  "fig11-LR-ROC.png",
+  plot = fig1,
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+```
+
+```{r}
+p5 <- make_roc_plot(test_full$Adverse_Outcome, rf1_pred_prob, "RF Full", "darkgreen")
+p6 <- make_roc_plot(test_full$Adverse_Outcome, rf1_tuned_pred_prob, "RF Full Tuned", "darkgreen")
+p7 <- make_roc_plot(test_reduced$Adverse_Outcome, rf2_pred_prob, "RF Reduced", "darkgreen")
+p8 <- make_roc_plot(test_reduced$Adverse_Outcome, rf2_tuned_pred_prob, "RF Reduced Tuned", "darkgreen")
+```
+
+
+```{r fig.cap="Figure 12. Random forest ROC curves."}
+fig2 <- (p5 + p6 + p7 + p8 + plot_layout(ncol = 2, guides = "collect"))
+fig2
+```
+
+The target outcome occurred in 15.4% of confirmed COVID-19 cases. All four logistic regression models performed similarly. The full dataset model with interaction effects performed slightly best, with 85.2% accuracy, 21.3% sensitivity, 96.9% specificity, an F1-score of 0.308, and an AUC of 0.831. However, the high accuracy was mainly driven by correct classification of the majority class, while the low sensitivity showed poor detection of adverse outcome cases.
+
+The random forest models also performed similarly to one another, and tuning did not produce meaningful improvement. The tuned full random forest model had 82% accuracy, 55.7% sensitivity, 86.8% specificity, an F1-score of 0.488, and an AUC of 0.8252. Although specificity was lower than logistic regression, random forest substantially improved sensitivity and F1-score.
+
+Overall, random forest provided the better balance between detecting adverse outcomes and controlling false positives. The F1-score improved from 0.308 for logistic regression to 0.488 for random forest, an increase of about 0.18. The main trade-off was interpretability: logistic regression provided directly interpretable log-odds coefficients, while random forest was more flexible but required variable importance measures for interpretation.
+
+```{r}
+ggsave(
+  "fig12-RF-ROC.png",
+  plot = fig2,
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+```
+
+## 8. Interpretation
+
+```{r}
+coef_table <- tibble(
+  Term = names(coef_values_int),
+  Coefficient = as.numeric(coef_values_int),
+  Abs_Coefficient = abs(as.numeric(coef_values_int)),
+  Odds_Ratio = exp(Coefficient)
+) %>%
+  arrange(desc(Abs_Coefficient)) %>%
+  slice_head(n = 10)
+
+knitr::kable(
+  coef_table,
+  digits = 3,
+  col.names = c("Predictor", "Coefficient", "Absolute Coefficient", "Odds Ratio"),
+  caption = "Table 3. Top 10 logistic regression coefficients by absolute value for the full interaction model."
+)
+```
+
+```{r fig.cap="Figure 13. Logistic regression variable importance."}
+p3 <- vip::vip(log_full_interaction, num_features = length(log_full_interaction$variable.importance), bar = FALSE)
+p4 <- vip::vip(log_reduced_interaction, num_features = length(log_reduced_interaction$variable.importance), bar = FALSE)
+
+p3 <- p3 + ggtitle("7.3.1 LR - Full Dataset")
+p4 <- p4 + ggtitle("7.3.2 LR - Reduced Dataset")
+
+vip_lr <- grid.arrange(p3, p4, nrow = 1)
+```
+
+```{r}
+ggsave(
+  "fig13-VIP-LR.png",
+  plot = vip_lr,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+```
+
+```{r fig.cap="Figure 14. Random forest variable importance."}
+p1 <- vip::vip(rf1_tuned, num_features = length(rf1_tuned$variable.importance), bar = FALSE)
+p2 <- vip::vip(rf2_tuned, num_features = length(rf2_tuned$variable.importance), bar = FALSE)
+
+p1 <- p1 + ggtitle("7.3.3 RF - Full Dataset")
+p2 <- p2 + ggtitle("7.3.4 RF - Reduced Dataset")
+
+vip_rf <- grid.arrange(p1, p2, nrow = 1)
+```
+
+```{r}
+ggsave(
+  "fig14-VIP-RF.png",
+  plot = vip_rf,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+```
+
+### 8.1 Most Important Predictors
+
+In Table 3, patients with four or more pre-existing conditions had 5.84 times the odds of adverse outcome compared with patients with no recorded conditions. The odds increased with condition count, from about 2.0 times higher for one condition to 4.32 times higher for three conditions.
+
+Chronic renal disease had an odds ratio of approximately 2.0, similar to having one recorded condition. Male patients had 1.87 times the odds of adverse outcome compared with female patients. Tobacco use and asthma had odds ratios around 0.5, suggesting lower estimated odds in this model, though these should not be interpreted as protective without further clinical validation.
+
+Variable importance showed similar patterns across models: age ranked highest, followed by condition count, diabetes, sex, and hypertension. Chronic renal disease had the highest random forest importance among near-zero variance features, consistent with the association rule results.
+
+### 8.2 Interaction Patterns
+
+The logistic regression interaction models provided a formal evaluation of selected interaction terms, but they did not substantially improve performance compared with the non-interaction models. This suggests that most predictive signal was captured by main effects, especially age, condition count, diabetes, hypertension, sex, and chronic renal disease.
+
+Random forest likely captured some nonlinear and interaction patterns internally, but these effects are less directly visible than logistic regression coefficients. Therefore, interpretation relied on combined evidence from odds ratios, variable importance, and association rule patterns.
+
+## 9. Limitations
+
+Sampling bias: This dataset includes confirmed positive COVID-19 cases identified through medical units, so individuals who were sick but never tested are not represented. This may underestimate total infections and bias the sample toward more severe cases or patients with greater healthcare access.
+
+Limited generalizability: The dataset comes from the first year of the pandemic, before widespread vaccination and later COVID-19 variants. As a result, the findings may not fully apply to later pandemic periods, vaccinated populations, or newer variants. In addition, the data were collected from medical units in Mexico, so the sample may not represent the general population or patients in other healthcare systems.
+
+Class imbalance: The target variable represented approximately 15% of observations. Hybrid sampling was applied only to the training data, while the test set retained the original class distribution. Because of this imbalance, sensitivity, F1-score, and AUC were emphasized over accuracy.
+
+Measurement error: Several conditions may have been self-reported or recorded during medical evaluation, which could cause underreporting of some pre-existing conditions. Some patients may also have been sent home but later experienced an adverse outcome, depending on follow-up timing.
+
+Missing variables: The Kaggle dataset included a limited set of demographic and pre-existing condition variables. Other relevant conditions, such as cancer or mental health disorders, were not available. The dataset also lacked clinical measurements and laboratory values that were available in the original government data. Including these variables would likely improve predictive performance.
+
+Overfitting: Overfitting did not appear to be a major issue because model performance was similar across versions and remained moderate overall. However, oversampling can increase overfitting risk, so performance was evaluated on the unchanged test set.
+
+## 10. Conclusions and Recommendations
+
+Age was the strongest factor associated with severe COVID-19 outcomes. Risk increased further when older age was combined with multiple pre-existing conditions. Chronic renal disease was also one of the most important predictors, showing consistently high lift in association rule mining and an elevated odds ratio in logistic regression. Consistent with the literature review, diabetes and hypertension were among the most prevalent conditions in the dataset. However, the results also showed that condition burden itself was important, as the odds of adverse outcome increased as the number of pre-existing conditions increased.
+
+For prediction, random forest performed better than logistic regression at identifying adverse outcome cases, with higher sensitivity and F1-score. Logistic regression remained more interpretable, but its low sensitivity limited its usefulness for detecting the minority class. The overall predictive performance was likely limited by the available variables, since this Kaggle dataset did not include laboratory values or detailed clinical measurements that were important in prior studies.
+
+These findings suggest that patients with chronic renal disease, multiple pre-existing conditions, and older age may require closer monitoring during severe respiratory outbreaks. Future research should use more current data that include vaccination status, newer COVID-19 variants, and clinical measurements to determine whether these risk patterns remain consistent in later pandemic periods.
